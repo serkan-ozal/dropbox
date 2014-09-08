@@ -1,0 +1,790 @@
+changeset:   11:5cf5dc62b0ed
+tag:         tip
+user:        serkanozal
+date:        Mon Sep 08 20:46:19 2014 +0300
+summary:     more reliable compressed-oops support
+
+diff -r b4bc510cbad0 -r 5cf5dc62b0ed jol-core/src/main/java/org/openjdk/jol/util/VMSupport.java
+--- a/jol-core/src/main/java/org/openjdk/jol/util/VMSupport.java	Wed May 07 16:57:55 2014 +0400
++++ b/jol-core/src/main/java/org/openjdk/jol/util/VMSupport.java	Mon Sep 08 20:46:19 2014 +0300
+@@ -27,12 +27,14 @@
+ import org.openjdk.jol.info.ClassData;
+ import org.openjdk.jol.info.ClassLayout;
+ import org.openjdk.jol.layouters.CurrentLayouter;
++
+ import sun.misc.Unsafe;
+ 
+ import javax.management.MBeanServer;
+ import javax.management.ObjectName;
+ import javax.management.RuntimeMBeanException;
+ import javax.management.openmbean.CompositeDataSupport;
++
+ import java.io.PrintWriter;
+ import java.io.StringWriter;
+ import java.lang.instrument.Instrumentation;
+@@ -55,6 +57,24 @@
+  */
+ public class VMSupport {
+ 
++	public static final String JAVA_VERSION = System.getProperty("java.version");
++	public static final String JAVA_SPEC_VERSION = System.getProperty("java.specification.version");
++	public static final String JAVA_RUNTIME_VERSION = System.getProperty("java.runtime.version");
++	public static final String JAVA_VENDOR = System.getProperty("java.vendor");
++	public static final String JVM_VENDOR = System.getProperty("java.vm.vendor");
++	public static final String JVM_VERSION = System.getProperty("java.vm.version");
++	public static final String JVM_NAME = System.getProperty("java.vm.name");
++	public static final String OS_ARCH = System.getProperty("os.arch");
++	public static final String OS_NAME = System.getProperty("os.name");
++	public static final String OS_VERSION = System.getProperty("os.version");
++	
++	public static final String JAVA_6 = "1.6";
++	public static final String JAVA_7 = "1.7";
++	public static final String JAVA_8 = "1.8";
++	
++	public static final JavaVersionInfo JAVA_VERSION_INFO = findJavaVersionInfo();
++	public static final JvmInfo JVM_INFO = findJvmInfo();
++	
+     private static Instrumentation INSTRUMENTATION;
+ 
+     public static final Unsafe U;
+@@ -65,7 +85,8 @@
+     public static final int OBJ_HEADER_SIZE;
+     public static final boolean USE_COMPRESSED_REFS;
+     public static final int COMPRESSED_REF_SHIFT;
+-
++    public static final long COMPRESSED_REF_BASE_ADDRESS;
++    
+     public static final int REF_SIZE;
+     public static final int BOOLEAN_SIZE;
+     public static final int BYTE_SIZE;
+@@ -78,6 +99,7 @@
+ 
+     private static final ThreadLocal<Object[]> BUFFERS;
+     private static final long OBJECT_ARRAY_BASE;
++    private static final int OBJECT_ARRAY_SCALE;
+ 
+     static {
+         U = AccessController.doPrivileged(
+@@ -97,6 +119,7 @@
+         );
+ 
+         OBJECT_ARRAY_BASE = U.arrayBaseOffset(Object[].class);
++        OBJECT_ARRAY_SCALE = U.arrayIndexScale(Object[].class);
+         BUFFERS = new ThreadLocal<Object[]>() {
+             @Override
+             protected Object[] initialValue() {
+@@ -120,6 +143,7 @@
+         VM_NAME = opts.name;
+         USE_COMPRESSED_REFS = opts.compressedRef;
+         COMPRESSED_REF_SHIFT = opts.compressRefShift;
++        COMPRESSED_REF_BASE_ADDRESS = opts.compressRefBaseAddress;
+         OBJ_ALIGNMENT = opts.objectAlignment;
+         REF_SIZE = opts.sizeReference;
+         BOOLEAN_SIZE = opts.sizeBoolean;
+@@ -134,7 +158,7 @@
+ 
+     public static long toNativeAddress(long address) {
+         if (USE_COMPRESSED_REFS) {
+-            return address << COMPRESSED_REF_SHIFT;
++            return COMPRESSED_REF_BASE_ADDRESS + (address << COMPRESSED_REF_SHIFT);
+         } else {
+             return address;
+         }
+@@ -158,7 +182,9 @@
+ 
+         out.println("Running " + (ADDRESS_SIZE * 8) + "-bit " + VM_NAME + " VM.");
+         if (USE_COMPRESSED_REFS)
+-            out.println("Using compressed references with " + COMPRESSED_REF_SHIFT + "-bit shift.");
++            out.println("Using compressed references with " + 
++            		COMPRESSED_REF_SHIFT + "-bit shift and " + 
++            		COMPRESSED_REF_BASE_ADDRESS + " base address.");
+         out.println("Objects are " + OBJ_ALIGNMENT + " bytes aligned.");
+ 
+         out.printf("%-19s: %d, %d, %d, %d, %d, %d, %d, %d, %d [bytes]%n",
+@@ -302,8 +328,10 @@
+     }
+ 
+     private static class VMOptions {
++    	
+         private final String name;
+         private final boolean compressedRef;
++        private final long compressRefBaseAddress;
+         private final int compressRefShift;
+         private final int objectAlignment;
+ 
+@@ -335,6 +363,7 @@
+             this.objectAlignment = guessAlignment(this.sizeReference);
+             this.compressedRef = false;
+             this.compressRefShift = 1;
++            this.compressRefBaseAddress = 0L;
+         }
+ 
+         public VMOptions(String name, int align) {
+@@ -343,6 +372,7 @@
+             this.objectAlignment = align;
+             this.compressedRef = true;
+             this.compressRefShift = MathUtil.log2p(align);
++            this.compressRefBaseAddress = 0L;
+         }
+ 
+         public VMOptions(String name, int align, int compRefShift) {
+@@ -351,6 +381,25 @@
+             this.objectAlignment = align;
+             this.compressedRef = true;
+             this.compressRefShift = compRefShift;
++            this.compressRefBaseAddress = 0L;
++        }
++        
++        public VMOptions(String name, int compRefShift, long compRefBaseAddress) {
++            this.name = name;
++            this.sizeReference = 4;
++            this.objectAlignment = guessAlignment(this.sizeReference);
++            this.compressedRef = true;
++            this.compressRefShift = compRefShift;
++            this.compressRefBaseAddress = compRefBaseAddress;
++        }
++        
++        public VMOptions(String name, int align, int compRefShift, long compRefBaseAddress) {
++            this.name = name;
++            this.sizeReference = 4;
++            this.objectAlignment = align;
++            this.compressedRef = true;
++            this.compressRefShift = compRefShift;
++            this.compressRefBaseAddress = compRefBaseAddress;
+         }
+ 
+         private static VMOptions getOptions() {
+@@ -398,13 +447,40 @@
+                         // if compressed oops are enabled, then this option is also accessible
+                         CompositeDataSupport alignmentValue = (CompositeDataSupport) server.invoke(mbean, "getVMOption", new Object[]{"ObjectAlignmentInBytes"}, new String[]{"java.lang.String"});
+                         int align = Integer.valueOf(alignmentValue.get("value").toString());
+-                        return new VMOptions("HotSpot", align);
++                        HotspotCompressedOopsUtil.CompressedOopsInfo compressedOopsInfo = 
++                        		HotspotCompressedOopsUtil.
++                        			getCompressedOopsInfo(	true, 
++                        									U.addressSize(), 
++                        									align);
++                        if (compressedOopsInfo != null) {
++                        	return 
++                        		new VMOptions(
++                        				"HotSpot", 
++                        				align, 
++                        				compressedOopsInfo.getShiftSizeForObjectPointers(),
++                        				compressedOopsInfo.getBaseAddressForObjectPointers());
++                        } else {
++                        	return new VMOptions("HotSpot", align);
++                        }	
+                     } else {
+                         return new VMOptions("HotSpot");
+                     }
+ 
+                 } catch (RuntimeMBeanException iae) {
+-                    return new VMOptions("HotSpot");
++                	HotspotCompressedOopsUtil.CompressedOopsInfo compressedOopsInfo = 
++                    		HotspotCompressedOopsUtil.
++                    			getCompressedOopsInfo(	true, 
++                    									U.addressSize(), 
++                    									0);
++                    if (compressedOopsInfo != null) {
++                    	return 
++                    		new VMOptions(
++                    				"HotSpot",  
++                    				compressedOopsInfo.getShiftSizeForObjectPointers(),
++                    				compressedOopsInfo.getBaseAddressForObjectPointers());
++                    } else {
++                    	return new VMOptions("HotSpot");
++                    }	
+                 }
+             } catch (RuntimeException re) {
+                 System.err.println("Failed to read HotSpot-specific configuration properly, please report this as the bug");
+@@ -562,5 +638,589 @@
+     static class MyDoubles4 {
+         private double f1, f2, f3, f4;
+     }
++    
++    private static JvmInfo findJvmInfo() {
++		String name = JVM_NAME.toLowerCase();
++		if (name.contains("hotspot") || name.contains("openjdk")) {
++			return JvmInfo.HOTSPOT_JVM;
++		} else if (name.contains("jrockit")) {
++			return JvmInfo.JROCKIT_JVM;
++		} else if (name.contains("ibm")) {
++			return JvmInfo.IBM_JVM;
++		} else {
++			throw new IllegalStateException("Jvm is not supported: " + JVM_NAME); 
++		}
++	}
++    
++    public static boolean isHotspotJvm() {
++        return JVM_INFO == JvmInfo.HOTSPOT_JVM;
++    }
++    
++    public static boolean isJRockitJvm() {
++    	return JVM_INFO == JvmInfo.JROCKIT_JVM;
++    }
++    
++    public static boolean isIBMJvm() {
++    	return JVM_INFO == JvmInfo.IBM_JVM;
++    }
++
++    private static JavaVersionInfo findJavaVersionInfo() {
++		if (JAVA_SPEC_VERSION.equals(JAVA_6)) {
++			return JavaVersionInfo.JAVA_VERSION_6;
++		} else if (JAVA_SPEC_VERSION.equals(JAVA_7)) {
++			return JavaVersionInfo.JAVA_VERSION_7;
++		} else if (JAVA_SPEC_VERSION.equals(JAVA_8)) {
++			return JavaVersionInfo.JAVA_VERSION_8;
++		} else {
++			throw new IllegalStateException("Java version is not supported: " + JAVA_SPEC_VERSION); 
++		}
++	}
++    
++	public static boolean isJava_6() {
++		return JAVA_VERSION_INFO == JavaVersionInfo.JAVA_VERSION_6;
++	}
++
++	public static boolean isJava_7() {
++		return JAVA_VERSION_INFO == JavaVersionInfo.JAVA_VERSION_7;
++	}
++	
++	public static boolean isJava_8() {
++		return JAVA_VERSION_INFO == JavaVersionInfo.JAVA_VERSION_8;
++	}
++    
++    public enum JvmInfo {
++		
++		HOTSPOT_JVM("Hotspot"),
++		JROCKIT_JVM("JRocit"),
++		IBM_JVM("IBM");
++		
++		String name;
++		
++		JvmInfo(String name) {
++			this.name = name;
++		}
++		
++		public String getName() {
++			return name;
++		}
++		
++	}
++    
++    public enum JavaVersionInfo {
++		
++		JAVA_VERSION_6(JAVA_6),
++		JAVA_VERSION_7(JAVA_7),
++		JAVA_VERSION_8(JAVA_8);
++		
++		String name;
++		
++		JavaVersionInfo(String name) {
++			this.name = name;
++		}
++		
++		public String getName() {
++			return name;
++		}
++		
++	}
++    
++    //////////////////////////////////////////////////////////////////////////////
++    
++    /**
++     * Utility class to find compressed-oops information by using memory layout of native JVM objects.
++     *
++     * @author Serkan OZAL
++     */
++    private static class HotspotCompressedOopsUtil {
++    	
++        private static final byte ADDRESS_SIZE_4_BYTE = 4;
++        private static final byte ADDRESS_SIZE_8_BYTE = 8;
++        
++        private static CompressedOopsInfo COMPRESSED_OOPS_INFO;
++        
++    	private HotspotCompressedOopsUtil() {
++            
++        }
++    	
++    	//////////////////////////////////////////////////////////////////////////////
++
++    	public synchronized static CompressedOopsInfo getCompressedOopsInfo(
++    			boolean compressRefs, int addressSize, int align) {
++    		if (!isHotspotJvm()) {
++    	    	return null;
++    	    }
++    		if (COMPRESSED_OOPS_INFO == null) {
++    			CompressedOopsInfoProvider compressedOopsInfoProvider = 
++    					createCompressedOopsInfoProvider(compressRefs, addressSize, align);
++    			if (compressedOopsInfoProvider != null) {
++    				COMPRESSED_OOPS_INFO = compressedOopsInfoProvider.getCompressedOopsInfo();
++    			}	
++    		}
++    	    return COMPRESSED_OOPS_INFO;
++    	}
++    	
++    	//////////////////////////////////////////////////////////////////////////////
++    	
++
++    	public static class CompressedOopsInfo {
++    	    
++    	    private long baseAddressForObjectPointers;
++    	    private int shiftSizeForObjectPointers;
++    	    private long baseAddressForClassPointers;
++            private int shiftSizeForClassPointers;
++            
++            public CompressedOopsInfo() {
++                
++            }
++            
++            public CompressedOopsInfo(  long baseAddressForObjectPointers, 
++                                        int shiftSizeForObjectPointers) {
++                this.baseAddressForObjectPointers = baseAddressForObjectPointers;
++                this.shiftSizeForObjectPointers = shiftSizeForObjectPointers;
++                this.baseAddressForClassPointers = baseAddressForObjectPointers;
++                this.shiftSizeForClassPointers = shiftSizeForObjectPointers;
++            }
++            
++            public CompressedOopsInfo(
++                    long baseAddressForObjectPointers, int shiftSizeForObjectPointers,
++                    long baseAddressForClassPointers, int shiftSizeForClassPointers) {
++                this.baseAddressForObjectPointers = baseAddressForObjectPointers;
++                this.shiftSizeForObjectPointers = shiftSizeForObjectPointers;
++                this.baseAddressForClassPointers = baseAddressForClassPointers;
++                this.shiftSizeForClassPointers = shiftSizeForClassPointers;
++            }
++            
++            public long getBaseAddressForObjectPointers() {
++                return baseAddressForObjectPointers;
++            }
++            
++            public int getShiftSizeForObjectPointers() {
++                return shiftSizeForObjectPointers;
++            }
++            
++            public long getBaseAddressForClassPointers() {
++                return baseAddressForClassPointers;
++            }
++
++            public int getShiftSizeForClassPointers() {
++                return shiftSizeForClassPointers;
++            }
++
++    	}
++    	
++        ////////////////////////////////////////////////////////////////////////////// 
++    	
++    	private static CompressedOopsInfoProvider createCompressedOopsInfoProvider(
++    			boolean compressRefs, int addressSize, int align) {
++            if (isJava_6()) {
++                return new Java6HotspotJvmCompressedOopsInfoProvider(compressRefs, addressSize, align);
++            } else if (isJava_7()) {
++                return new Java7HotspotJvmCompressedOopsInfoProvider(compressRefs, addressSize, align);
++            } else if (isJava_8()) {
++                return new Java8HotspotJvmCompressedOopsInfoProvider(compressRefs, addressSize, align);
++            } else {
++                return null;
++            }    
++        }
++        
++        //////////////////////////////////////////////////////////////////////////////	
++    	
++    	private static class CompressedOopsProviderCavy {
++    	    
++    	}
++    	
++    	private interface CompressedOopsInfoProvider {
++    	    
++    	    CompressedOopsInfo getCompressedOopsInfo();
++    	    
++    	}
++    	
++    	private static abstract class AbstractCompressedOopsInfoProvider 
++    	        implements CompressedOopsInfoProvider {
++    	    
++    	    protected static final int DEFAULT_COMPRESSED_OOP_SHIFT_SIZE = 3;
++    	    
++    	    protected final boolean compressedOopsHandlingStrategyForObjectAndClassIsDifferent;
++    	    protected final HotspotJvmClassAddressFinder hotspotJvmClassAddressFinder;
++    	    protected final int align;
++    	    
++    	    protected AbstractCompressedOopsInfoProvider(
++    	            boolean compressedOopsHandlingStrategyForObjectAndClassIsDifferent,
++    	            boolean compressRefs, int addressSize, int align) {
++    	        this.compressedOopsHandlingStrategyForObjectAndClassIsDifferent = 
++    	        		compressedOopsHandlingStrategyForObjectAndClassIsDifferent;
++    	        this.hotspotJvmClassAddressFinder = 
++    	        		createClassAddressFinder(compressRefs, addressSize);
++    	        this.align = align;
++    	    }
++    	    
++    	    @Override
++            public CompressedOopsInfo getCompressedOopsInfo() {
++    	    	if (hotspotJvmClassAddressFinder == null) {
++    	    		return null;
++    	    	}
++    	    	
++    	    	final int COMPRESSED_OOP_SHIFT_SIZE = 
++    	    			(align > 0) ? 
++    	    				MathUtil.log2p(align) : 
++    	    				DEFAULT_COMPRESSED_OOP_SHIFT_SIZE;
++
++                long nativeAddressOfClass = 
++                        hotspotJvmClassAddressFinder.
++                            nativeAddressOfClass(CompressedOopsProviderCavy.class);
++                long jvmAddressOfClass = 
++                        hotspotJvmClassAddressFinder.
++                            jvmAddressOfClass(CompressedOopsProviderCavy.class);
++                if (!compressedOopsHandlingStrategyForObjectAndClassIsDifferent) {
++                    if (nativeAddressOfClass == jvmAddressOfClass) {
++                        return new CompressedOopsInfo(0L, 0);
++                    } else {
++                        long shiftedAddress = jvmAddressOfClass << COMPRESSED_OOP_SHIFT_SIZE;
++                        return new CompressedOopsInfo(nativeAddressOfClass - shiftedAddress, COMPRESSED_OOP_SHIFT_SIZE);
++                    }
++                }
++                else {
++                    long nativeAddressOfClassInstance = 
++                            hotspotJvmClassAddressFinder.
++                                nativeAddressOfClassInstance(CompressedOopsProviderCavy.class);
++                    long jvmAddressOfClassInstance = 
++                            hotspotJvmClassAddressFinder.
++                                jvmAddressOfClassInstance(CompressedOopsProviderCavy.class);
++                    
++                    long baseAddressForObjectPointers = 0L;
++                    int shiftSizeForObjectPointers = 0;
++                    long baseAddressForClassPointers = 0L;
++                    int shiftSizeForClassPointers = 0;
++                    
++                    if (nativeAddressOfClass != jvmAddressOfClass) {
++                        long shiftedAddress = jvmAddressOfClass << COMPRESSED_OOP_SHIFT_SIZE;
++                        baseAddressForObjectPointers = nativeAddressOfClass - shiftedAddress;
++                        shiftSizeForObjectPointers = COMPRESSED_OOP_SHIFT_SIZE;
++                    } 
++                    
++                    if (nativeAddressOfClassInstance != jvmAddressOfClassInstance) {
++                        long shiftedAddress = jvmAddressOfClassInstance << COMPRESSED_OOP_SHIFT_SIZE;
++                        baseAddressForClassPointers = nativeAddressOfClassInstance - shiftedAddress;
++                        shiftSizeForClassPointers = COMPRESSED_OOP_SHIFT_SIZE;
++                    } 
++                    
++                    return 
++                        new CompressedOopsInfo(
++                                baseAddressForObjectPointers, 
++                                shiftSizeForObjectPointers, 
++                                baseAddressForClassPointers, 
++                                shiftSizeForClassPointers);
++                }
++            }
++    	    
++    	}
++    	
++    	private static class Java6HotspotJvmCompressedOopsInfoProvider 
++    	        extends AbstractCompressedOopsInfoProvider {
++
++            public Java6HotspotJvmCompressedOopsInfoProvider(
++            		boolean compressRefs, int addressSize, int align) {
++                super(false, compressRefs, addressSize, align);
++            }
++    	    
++    	}
++    	
++    	private static class Java7HotspotJvmCompressedOopsInfoProvider 
++                extends AbstractCompressedOopsInfoProvider {
++        
++            public Java7HotspotJvmCompressedOopsInfoProvider(
++            		boolean compressRefs, int addressSize, int align) {
++                super(false, compressRefs, addressSize, align);
++            }
++        
++        }
++    	
++    	private static class Java8HotspotJvmCompressedOopsInfoProvider 
++                extends AbstractCompressedOopsInfoProvider {
++            
++            public Java8HotspotJvmCompressedOopsInfoProvider(
++            		boolean compressRefs, int addressSize, int align) {
++                super(true, compressRefs, addressSize, align);
++            }
++            
++        }
++    	
++        //////////////////////////////////////////////////////////////////////////////
++    	
++    	private static HotspotJvmClassAddressFinder createClassAddressFinder(
++    			boolean compressRefs, int addressSize) {
++    	    if (isJava_6()) {
++    	        if (addressSize == ADDRESS_SIZE_4_BYTE) {
++    	            return new Java6On32BitHotspotJvmClassAddressFinder();
++    	        } else if (addressSize == ADDRESS_SIZE_8_BYTE) {
++    	            if (compressRefs) {
++    	                return new Java6On64BitHotspotJvmWithCompressedOopsClassAddressFinder();
++    	            } else {
++    	                return new Java6On64BitHotspotJvmWithoutCompressedOopsClassAddressFinder();
++    	            }
++                } else {
++    	            return null;
++    	        }
++    	    }
++    	    else if (isJava_7()) {
++    	        if (addressSize == ADDRESS_SIZE_4_BYTE) {
++                    return new Java7On32BitHotspotJvmClassAddressFinder();
++                } else if (addressSize == ADDRESS_SIZE_8_BYTE) {
++                    if (compressRefs) {
++                        return new Java7On64BitHotspotJvmWithCompressedOopsClassAddressFinder();
++                    } else {
++                        return new Java7On64BitHotspotJvmWithoutCompressedOopsClassAddressFinder();
++                    }
++                } else {
++                	return null;
++                }
++            }
++    	    else if (isJava_8()) {
++    	        if (addressSize == ADDRESS_SIZE_4_BYTE) {
++                    return new Java8On32BitHotspotJvmClassAddressFinder();
++                } else if (addressSize == ADDRESS_SIZE_8_BYTE) {
++                    if (compressRefs) {
++                        return new Java8On64BitHotspotJvmWithCompressedOopsClassAddressFinder();
++                    } else {
++                        return new Java8On64BitHotspotJvmWithoutCompressedOopsClassAddressFinder();
++                    }
++                } else {
++                	return null;
++                }
++            } else {
++    	    	return null;
++    	    }    
++    	}
++    	
++    	private static interface HotspotJvmClassAddressFinder {
++    	    
++    	    long CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_INSTANCE_32_BIT_FOR_JAVA_6 = 8L; 
++    	    long CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_INSTANCE_64_BIT_WITH_COMPRESSED_REF_FOR_JAVA_6 = 12L;
++    	    long CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_INSTANCE_64_BIT_WITHOUT_COMPRESSED_REF_FOR_JAVA_6 = 16L;
++    	    
++    	    long CLASS_INSTANCE_POINTER_OFFSET_IN_CLASS_DEFINITION_32_BIT_FOR_JAVA_6 = 60L; 
++            long CLASS_INSTANCE_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITH_COMPRESSED_REF_FOR_JAVA_6 = 112L;
++            long CLASS_INSTANCE_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITHOUT_COMPRESSED_REF_FOR_JAVA_6 = 112L;
++    	    
++    	    long CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_DEFINITION_32_BIT_FOR_JAVA_6 = 32L; 
++            long CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITH_COMPRESSED_REF_FOR_JAVA_6 = 56L;
++            long CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITHOUT_COMPRESSED_REF_FOR_JAVA_6 = 56L;
++    	    
++            //////////////////////////////////////////////////////////////////////////////
++            
++    	    long CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_INSTANCE_32_BIT_FOR_JAVA_7 = 80L; 
++    	    long CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_INSTANCE_64_BIT_WITH_COMPRESSED_REF_FOR_JAVA_7 = 84L;
++    	    long CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_INSTANCE_64_BIT_WITHOUT_COMPRESSED_REF_FOR_JAVA_7 = 160L;
++    	    
++    	    long CLASS_INSTANCE_POINTER_OFFSET_IN_CLASS_DEFINITION_32_BIT_FOR_JAVA_7 = 64L; 
++            long CLASS_INSTANCE_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITH_COMPRESSED_REF_FOR_JAVA_7 = 120L;
++            long CLASS_INSTANCE_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITHOUT_COMPRESSED_REF_FOR_JAVA_7 = 120L;
++            
++            long CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_DEFINITION_32_BIT_FOR_JAVA_7 = 36L; 
++            long CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITH_COMPRESSED_REF_FOR_JAVA_7 = 64L;
++            long CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITHOUT_COMPRESSED_REF_FOR_JAVA_7 = 64L;
++    	    
++    	    //////////////////////////////////////////////////////////////////////////////
++    	    
++    	    long CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_INSTANCE_32_BIT_FOR_JAVA_8 = 64L; 
++    	    long CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_INSTANCE_64_BIT_WITH_COMPRESSED_REF_FOR_JAVA_8 = 64L;
++    	    long CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_INSTANCE_64_BIT_WITHOUT_COMPRESSED_REF_FOR_JAVA_8 = 120L;
++    	    
++    	    long CLASS_INSTANCE_POINTER_OFFSET_IN_CLASS_DEFINITION_32_BIT_FOR_JAVA_8 = 56L; 
++    	    long CLASS_INSTANCE_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITH_COMPRESSED_REF_FOR_JAVA_8 = 48L;
++    	    long CLASS_INSTANCE_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITHOUT_COMPRESSED_REF_FOR_JAVA_8 = 104L;
++    	        
++    	    long CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_DEFINITION_32_BIT_FOR_JAVA_8 = 28L; 
++    	    long CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITH_COMPRESSED_REF_FOR_JAVA_8 = 48L;
++    	    long CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITHOUT_COMPRESSED_REF_FOR_JAVA_8 = 48L;
++    	    
++    	    //////////////////////////////////////////////////////////////////////////////
++    	    
++    	    long jvmAddressOfClassInstance(Class<?> clazz);
++            long nativeAddressOfClassInstance(Class<?> clazz);
++            
++    	    long jvmAddressOfClass(Class<?> clazz);
++    	    long nativeAddressOfClass(Class<?> clazz);
++    	    
++    	}
++    	
++    	private static abstract class AbstractHotspotJvmClassAddressFinder 
++    	        implements HotspotJvmClassAddressFinder {
++    	               
++    	    protected final Object[] temp = new Object[1];
++    	    
++    	    protected long classDefPointerOffsetInClassInst; 
++    	    protected long classInstPointerOffsetInClassDef; 
++    	    protected long classDefPointerOffsetInClassDef; 
++    	    
++    	    @SuppressWarnings("unused")
++            protected AbstractHotspotJvmClassAddressFinder() {
++    	        
++    	    }
++    	    
++    	    protected AbstractHotspotJvmClassAddressFinder(
++                    long classDefPointerOffsetInClassInst,
++                    long classInstPointerOffsetInClassDef,
++                    long classDefPointerOffsetInClassDef) {
++                this.classDefPointerOffsetInClassInst = classDefPointerOffsetInClassInst;
++                this.classInstPointerOffsetInClassDef = classInstPointerOffsetInClassDef;
++                this.classDefPointerOffsetInClassDef = classDefPointerOffsetInClassDef;
++            }
++
++            protected long normalize(int value) {
++    	        return value & 0xFFFFFFFFL;
++    	    }
++            
++            @Override
++            public synchronized long jvmAddressOfClassInstance(Class<?> clazz) {
++                try {
++                    temp[0] = clazz;
++                    return normalize(U.getInt( temp, OBJECT_ARRAY_BASE));
++                } finally {
++                    temp[0] = null;
++                }
++            }
++
++            @Override
++            public synchronized long nativeAddressOfClassInstance(Class<?> clazz) {
++                try {
++                    U.putInt(  temp, 
++                    		   OBJECT_ARRAY_BASE, 
++                               (int)jvmAddressOfClass(clazz));
++                    Object o = temp[0];
++                    return U.getInt(o, classInstPointerOffsetInClassDef);
++                } finally {
++                    temp[0] = null;
++                }    
++            }
++            
++            @Override
++            public synchronized long jvmAddressOfClass(Class<?> clazz) {
++                return normalize(U.getInt(clazz, classDefPointerOffsetInClassInst));
++            }
++            
++            @Override
++            public synchronized long nativeAddressOfClass(Class<?> clazz) {
++                try {
++                    U.putInt(  temp, 
++                    		   OBJECT_ARRAY_BASE, 
++                               (int)jvmAddressOfClass(clazz));
++                    Object o = temp[0];
++                    return U.getInt(o, classDefPointerOffsetInClassDef);
++                } finally {
++                    temp[0] = null;
++                }    
++            }
++    	
++    	}
++    	
++    	//////////////////////////////////////////////////////////////////////////////
++    	
++    	private static class Java6On32BitHotspotJvmClassAddressFinder 
++    	        extends AbstractHotspotJvmClassAddressFinder {
++    	  
++    	    private Java6On32BitHotspotJvmClassAddressFinder() {
++                super(  CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_INSTANCE_32_BIT_FOR_JAVA_6,
++                        CLASS_INSTANCE_POINTER_OFFSET_IN_CLASS_DEFINITION_32_BIT_FOR_JAVA_6,
++                        CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_DEFINITION_32_BIT_FOR_JAVA_6);
++    	    }
++    	    
++        }
++        
++        private static class Java6On64BitHotspotJvmWithoutCompressedOopsClassAddressFinder 
++                extends AbstractHotspotJvmClassAddressFinder {
++            
++            private Java6On64BitHotspotJvmWithoutCompressedOopsClassAddressFinder() {
++                super(  CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_INSTANCE_64_BIT_WITHOUT_COMPRESSED_REF_FOR_JAVA_6,
++                        CLASS_INSTANCE_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITHOUT_COMPRESSED_REF_FOR_JAVA_6,
++                        CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITHOUT_COMPRESSED_REF_FOR_JAVA_6);
++            }
++            
++        }
++        
++        private static class Java6On64BitHotspotJvmWithCompressedOopsClassAddressFinder 
++                extends AbstractHotspotJvmClassAddressFinder {
++            
++            private Java6On64BitHotspotJvmWithCompressedOopsClassAddressFinder() {
++                super(  CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_INSTANCE_64_BIT_WITH_COMPRESSED_REF_FOR_JAVA_6,
++                        CLASS_INSTANCE_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITH_COMPRESSED_REF_FOR_JAVA_6,
++                        CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITH_COMPRESSED_REF_FOR_JAVA_6);
++            }
++           
++        }
++    	
++        //////////////////////////////////////////////////////////////////////////////
++        
++    	private static class Java7On32BitHotspotJvmClassAddressFinder 
++    	        extends AbstractHotspotJvmClassAddressFinder {
++
++    	    private Java7On32BitHotspotJvmClassAddressFinder() {
++                super(  CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_INSTANCE_32_BIT_FOR_JAVA_7,
++                        CLASS_INSTANCE_POINTER_OFFSET_IN_CLASS_DEFINITION_32_BIT_FOR_JAVA_7,
++                        CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_DEFINITION_32_BIT_FOR_JAVA_7);
++            }
++    	    
++    	}
++    	
++    	private static class Java7On64BitHotspotJvmWithoutCompressedOopsClassAddressFinder 
++    	        extends AbstractHotspotJvmClassAddressFinder {
++            
++    	    private Java7On64BitHotspotJvmWithoutCompressedOopsClassAddressFinder() {
++                super(  CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_INSTANCE_64_BIT_WITHOUT_COMPRESSED_REF_FOR_JAVA_7,
++                        CLASS_INSTANCE_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITHOUT_COMPRESSED_REF_FOR_JAVA_7,
++                        CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITHOUT_COMPRESSED_REF_FOR_JAVA_7);
++            }
++    	    
++        }
++    	
++    	private static class Java7On64BitHotspotJvmWithCompressedOopsClassAddressFinder 
++    	        extends AbstractHotspotJvmClassAddressFinder {
++            
++    	    private Java7On64BitHotspotJvmWithCompressedOopsClassAddressFinder() {
++                super(  CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_INSTANCE_64_BIT_WITH_COMPRESSED_REF_FOR_JAVA_7,
++                        CLASS_INSTANCE_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITH_COMPRESSED_REF_FOR_JAVA_7,
++                        CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITH_COMPRESSED_REF_FOR_JAVA_7);
++            }
++    	   
++        }
++    	
++        //////////////////////////////////////////////////////////////////////////////
++    	
++        private static class Java8On32BitHotspotJvmClassAddressFinder 
++                extends AbstractHotspotJvmClassAddressFinder {
++            
++            private Java8On32BitHotspotJvmClassAddressFinder() {
++                super(  CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_INSTANCE_32_BIT_FOR_JAVA_8,
++                        CLASS_INSTANCE_POINTER_OFFSET_IN_CLASS_DEFINITION_32_BIT_FOR_JAVA_8,
++                        CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_DEFINITION_32_BIT_FOR_JAVA_8);
++            }
++
++        }
++        
++        private static class Java8On64BitHotspotJvmWithoutCompressedOopsClassAddressFinder 
++                extends AbstractHotspotJvmClassAddressFinder {
++            
++            private Java8On64BitHotspotJvmWithoutCompressedOopsClassAddressFinder() {
++                super(  CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_INSTANCE_64_BIT_WITHOUT_COMPRESSED_REF_FOR_JAVA_8,
++                        CLASS_INSTANCE_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITHOUT_COMPRESSED_REF_FOR_JAVA_8,
++                        CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITHOUT_COMPRESSED_REF_FOR_JAVA_8);
++            }
++            
++        }
++        
++        private static class Java8On64BitHotspotJvmWithCompressedOopsClassAddressFinder 
++                extends AbstractHotspotJvmClassAddressFinder {
++            
++            private Java8On64BitHotspotJvmWithCompressedOopsClassAddressFinder() {
++                super(  CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_INSTANCE_64_BIT_WITH_COMPRESSED_REF_FOR_JAVA_8,
++                        CLASS_INSTANCE_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITH_COMPRESSED_REF_FOR_JAVA_8,
++                        CLASS_DEFINITION_POINTER_OFFSET_IN_CLASS_DEFINITION_64_BIT_WITH_COMPRESSED_REF_FOR_JAVA_8);
++            }
++            
++        }
++        
++        //////////////////////////////////////////////////////////////////////////////    
++        
++    }
+ 
+ }
+
